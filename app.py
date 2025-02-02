@@ -1,0 +1,262 @@
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+import logging
+from datetime import datetime
+import os
+from llm import analyze_repo
+from github import Github
+import requests
+import jwt
+import time
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+README_BRANCH_NAME = "readme-automation"
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+def generate_jwt():
+    try:
+        private_key = os.getenv('GITHUB_PRIVATE_KEY')
+        if not private_key:
+            raise ValueError("GITHUB_PRIVATE_KEY not set")
+            
+        if private_key.startswith('-----'):
+            private_key_content = private_key
+        else:
+            import base64
+            private_key_content = base64.b64decode(private_key).decode('utf-8')
+            
+        app_id = os.getenv('GITHUB_APP_ID')
+        if not app_id:
+            raise ValueError("GITHUB_APP_ID not set")
+            
+        now = int(time.time())
+        payload = {
+            'iat': now,  
+            'exp': now + (10 * 60),  
+            'iss': app_id 
+        }
+        
+        
+        token = jwt.encode(
+            payload,
+            private_key_content,
+            algorithm='RS256'
+        )
+        
+        logger.info("Successfully generated JWT token")
+        return token
+        
+    except Exception as e:
+        logger.error(f"Error generating JWT: {str(e)}")
+        raise
+
+async def update_readme(installation_id: int, repo_full_name: str) -> dict:
+    """Update README.md and create/update PR"""
+    try:
+        current_time = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        user_login = "taradepan"
+        repo_url = f"https://github.com/{repo_full_name}"
+
+        context = {
+            "time": current_time,
+            "user": user_login,
+            "repo_url": repo_url
+        }
+        
+        logger.info(f"Starting README update for {repo_url}")
+        
+        jwt_token = generate_jwt()
+        headers = {
+            'Authorization': f'Bearer {jwt_token}',
+            'Accept': 'application/vnd.github.v3+json'
+        }
+        
+        logger.info("Getting installation token...")
+        response = requests.post(
+            f'https://api.github.com/app/installations/{installation_id}/access_tokens',
+            headers=headers
+        )
+        
+        if response.status_code != 201:
+            raise Exception(f"Failed to get installation token: {response.text}")
+            
+        token = response.json()['token']
+        logger.info("Successfully got installation token")
+        
+        g = Github(token)
+        repo = g.get_repo(repo_full_name)
+        
+        existing_prs = list(repo.get_pulls(
+            state='open',
+            head=f"{repo.owner.login}:{README_BRANCH_NAME}"
+        ))
+        if existing_prs:
+            logger.info(f"PR already exists: {existing_prs[0].html_url}")
+            return {
+                "status": "skipped",
+                "message": "PR already exists",
+                "pr_url": existing_prs[0].html_url
+            }
+
+        logger.info("Generating README content...")
+        readme_content = await analyze_repo(repo_url, context)
+        
+        default_branch = repo.default_branch
+        base_branch = repo.get_branch(default_branch)
+        
+        try:
+            ref = repo.get_git_ref(f"heads/{README_BRANCH_NAME}")
+            ref.delete()
+            logger.info(f"Deleted existing branch: {README_BRANCH_NAME}")
+        except:
+            logger.info(f"No existing branch to delete: {README_BRANCH_NAME}")
+        
+        repo.create_git_ref(
+            f"refs/heads/{README_BRANCH_NAME}", 
+            base_branch.commit.sha
+        )
+        logger.info(f"Created new branch: {README_BRANCH_NAME}")
+        
+        commit_message = "📝 [Automated] Update README.md"
+        try:
+            contents = repo.get_contents("README.md", ref=README_BRANCH_NAME)
+            repo.update_file(
+                contents.path,
+                commit_message,
+                readme_content,
+                contents.sha,
+                branch=README_BRANCH_NAME
+            )
+            logger.info("Updated existing README.md")
+        except:
+            repo.create_file(
+                "README.md",
+                commit_message,
+                readme_content,
+                branch=README_BRANCH_NAME
+            )
+            logger.info("Created new README.md")
+        
+        pr_title = "📝 [Automated] Update README.md"
+        pr_body = f"""## 🤖 Automated README Update
+
+This pull request was automatically generated to update the repository's README.md file.
+
+### 📊 Update Information
+- **Repository:** [{repo_full_name}]({repo_url})
+- **Generated on:** {current_time} UTC
+- **Generated by:** [@{user_login}](https://github.com/{user_login})'s README Bot
+
+<summary>ℹ️ Bot Information</summary>
+
+- **Branch:** `{README_BRANCH_NAME}`
+- **Base:** `{default_branch}`
+- **Commit Message:** `{commit_message}`
+
+---
+> 🔄 This PR will be automatically updated if new changes are pushed to the repository.
+"""
+        
+        pr = repo.create_pull(
+            title=pr_title,
+            body=pr_body,
+            head=README_BRANCH_NAME,
+            base=default_branch
+        )
+        
+        try:
+            pr.add_to_labels("automated", "readme")
+        except:
+            logger.info("Could not add labels to PR")
+        
+        logger.info(f"Created PR: {pr.html_url}")
+        return {
+            "status": "success", 
+            "pr_url": pr.html_url,
+            "message": "Created new PR with updated README",
+            "timestamp": current_time
+        }
+            
+    except Exception as e:
+        logger.error(f"Error updating README: {str(e)}")
+        return {
+            "status": "error", 
+            "message": str(e),
+            "timestamp": current_time
+        }
+
+@app.post("/webhook")
+async def webhook(request: Request):
+    """Handle GitHub webhook events"""
+    try:
+        payload = await request.json()
+        event_type = request.headers.get("X-GitHub-Event", "")
+        
+        logger.info(f"Received webhook: {event_type}")
+        
+        if event_type == "push":
+            repository = payload.get('repository', {})
+            ref = payload.get('ref', '')
+            default_branch = repository.get('default_branch', '')
+            
+            if f"refs/heads/{default_branch}" == ref:
+                head_commit = payload.get('head_commit', {})
+                commit_message = head_commit.get('message', '')
+                
+                if (commit_message.startswith('📝') or  
+                    commit_message.startswith('Merge pull request') and README_BRANCH_NAME in commit_message or  
+                    'readme-automation' in commit_message.lower()):  
+                    logger.info(f"Ignoring bot commit: {commit_message}")
+                    return JSONResponse(content={
+                        "status": "ignored",
+                        "message": "Ignoring automated commit or merge"
+                    })
+                    
+                logger.info(f"Processing push to {repository.get('full_name')}")
+                logger.info(f"Commit message: {commit_message}")
+                
+                installation_id = payload.get('installation', {}).get('id')
+                repo_full_name = repository.get('full_name')
+                
+                if not installation_id or not repo_full_name:
+                    raise ValueError("Missing required webhook data")
+                    
+                result = await update_readme(installation_id, repo_full_name)
+                return JSONResponse(content=result)
+        
+        return JSONResponse(content={
+            "status": "ignored",
+            "message": f"Ignoring {event_type} event"
+        })
+
+    except Exception as e:
+        logger.error(f"Webhook error: {str(e)}")
+        return JSONResponse(
+            content={"status": "error", "message": str(e)},
+            status_code=500
+        )
+
+@app.get("/")
+async def root():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run("app:app", host="0.0.0.0", port=port)
