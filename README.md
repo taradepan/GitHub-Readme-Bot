@@ -22,7 +22,8 @@ To set up the GitHub Readme Bot, follow these steps:
 2. Create a new GitHub App and generate a private key, app ID, and webhook secret 🔒
 3. Set environment variables using the `.env.example` file as a reference 📝
 4. Install dependencies using `pip install -r requirements.txt` 📦
-5. Run the application using `uvicorn app:app --host=0.0.0.0 --port=$PORT` 🚀
+5. Run the application using `uvicorn app:app --host=0.0.0.0 --port=$PORT` (on a remote server) 🚀
+6. Paste the remote server endpoint to the GitHub Apps. 
 
 ## 📄 Usage Guide
 To use the GitHub Readme Bot, follow these steps:
